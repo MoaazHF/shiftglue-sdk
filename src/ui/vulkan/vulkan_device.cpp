@@ -46,9 +46,13 @@ REXCVAR_DEFINE_BOOL(vulkan_require_fragment_stores_and_atomics, true, "UI/Vulkan
                     "Deprecated and ignored for parity; fragmentStoresAndAtomics is always "
                     "required for Vulkan GPU emulation")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+// Mali (G710 and others) doesn't expose vertexPipelineStoresAndAtomics.
+// Experimental opt-in: set false to accept such devices; vertex shader memory
+// export is then skipped (guest memory writes are lost, pixel shader memory
+// export still works) and each affected shader is logged once.
 REXCVAR_DEFINE_BOOL(vulkan_require_vertex_pipeline_stores_and_atomics, true, "UI/Vulkan",
-                    "Deprecated and ignored for parity; vertexPipelineStoresAndAtomics is always "
-                    "required for Vulkan GPU emulation")
+                    "Require vertexPipelineStoresAndAtomics for Vulkan GPU emulation (experimental: "
+                    "set false to allow devices without it, skipping vertex shader memory export)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 // Apple Silicon / MoltenVK does not expose geometryShader or fillModeNonSolid,
 // and many mobile drivers (Mali, older Adreno, the emulator over MoltenVK)
@@ -348,11 +352,17 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
       return nullptr;
     }
     if (!supported_features.vertexPipelineStoresAndAtomics) {
+      if (REXCVAR_GET(vulkan_require_vertex_pipeline_stores_and_atomics)) {
+        REXLOG_WARN(
+            "Vulkan device '{}' doesn't support vertexPipelineStoresAndAtomics, but "
+            "vulkan_require_vertex_pipeline_stores_and_atomics=true",
+            properties.deviceName);
+        return nullptr;
+      }
       REXLOG_WARN(
-          "Vulkan device '{}' doesn't support vertexPipelineStoresAndAtomics, which "
-          "is required for Vulkan GPU emulation parity",
+          "Vulkan device '{}' doesn't support vertexPipelineStoresAndAtomics; vertex "
+          "shader memory export will be skipped",
           properties.deviceName);
-      return nullptr;
     }
     if (REXCVAR_GET(vulkan_require_geometry_shader) && !supported_features.geometryShader) {
       REXLOG_WARN(
