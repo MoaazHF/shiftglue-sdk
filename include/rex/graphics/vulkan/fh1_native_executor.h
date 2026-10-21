@@ -178,6 +178,7 @@ class Fh1NativeExecutor {
   // each pixel's depth with its slot's matrix.
   static constexpr uint32_t kMaxObjectSlots = 256;
   void SetObjectMotionEnabled(bool enabled) { object_motion_enabled_ = enabled; }
+  bool ObjectMotionEnabled() const { return object_motion_enabled_; }
   // Whether the current draw should write its slot: a draw testing and
   // writing the scene's depth whose vertex shader reads the camera's matrix
   // or an object's own (DrawObjectMatrixRegister).
@@ -224,6 +225,19 @@ class Fh1NativeExecutor {
     if (token == UINT64_MAX || uint32_t(token) == UINT32_MAX) return;
     GpuEnd(GpuPhase(kGpuPhases + uint32_t(token >> 32)), uint32_t(token));
   }
+  // fh1_visibility_census: an occlusion query around each draw of a sampled
+  // frame, to count draws that pass no samples (the item-2 ceiling).
+  uint32_t VisBegin(const Fh1DrawInfo& draw, reg::RB_DEPTHCONTROL depth,
+                    uint32_t vertex_count);
+  // fh1_visibility_census_no_depth: census frames draw without the depth
+  // test, so draws that still pass no samples are off screen (or discard).
+  bool VisNoDepth() const;
+  bool VisActive() const { return vis_query_pool_ != VK_NULL_HANDLE; }
+  // fh1_visibility_oracle_skip (item-2 ceiling, renders wrong): the draw
+  // with this key (and ordinal in the frame) passed no samples at its last
+  // census, so it is dropped before its derivation.
+  bool VisOracleSkip(uint64_t key);
+  void VisEnd(uint32_t query);
 
  private:
   using SurfaceKey = Fh1SurfaceKey;
@@ -329,6 +343,13 @@ class Fh1NativeExecutor {
     // In readback_buffer_.
     VkDeviceSize offset;
   };
+  struct DeferredReadback {
+    uint32_t address;
+    uint32_t length;
+    // In deferred_readback_buffer_.
+    VkDeviceSize offset;
+    uint64_t submission;
+  };
   struct ResolveReadback {
     uint64_t last_used_frame = 0;
     uint64_t run_start_frame = 0;
@@ -425,6 +446,11 @@ class Fh1NativeExecutor {
   uint32_t pending_clear_surfaces_ = 0;
   bool IsOneOffResolve(uint32_t address, uint32_t length);
   void QueueResolveReadback(uint32_t address, uint32_t length);
+  // Small resolves the CPU reads every frame (the auto exposure's luminance,
+  // #548): copied into a ring and written to guest memory once their
+  // submission has completed, a frame or two late, never waiting for the GPU.
+  void QueueDeferredReadback(uint32_t address, uint32_t length);
+  void ApplyCompletedDeferredReadbacks();
 
   // Dynamic rendering into one surface for transfers and clears.
   void BeginSurfaceRendering(Surface& surface, bool uint_view);
@@ -639,6 +665,12 @@ class Fh1NativeExecutor {
   VkDeviceSize readback_size_ = 0;
   VkDeviceSize readback_used_ = 0;
   const uint8_t* readback_mapped_ = nullptr;
+  static constexpr VkDeviceSize kDeferredReadbackSize = 64 * 1024;
+  std::deque<DeferredReadback> deferred_readbacks_;
+  VkBuffer deferred_readback_buffer_ = VK_NULL_HANDLE;
+  VkDeviceMemory deferred_readback_memory_ = VK_NULL_HANDLE;
+  const uint8_t* deferred_readback_mapped_ = nullptr;
+  VkDeviceSize deferred_readback_next_ = 0;
   std::map<uint64_t, ResolveReadback> resolve_readbacks_;
 
   // Targets PrepareTargets derived for the draw BindTargets binds.
@@ -761,6 +793,43 @@ class Fh1NativeExecutor {
   std::map<std::pair<uint32_t, std::string>, uint64_t> gpu_label_enders_;
   void GpuMarkRendering(uint32_t label);
   uint32_t GpuLabel(const std::string& label);
+  static constexpr uint32_t kVisQueries = 16384;
+  struct VisDraw {
+    uint64_t key;
+    uint32_t label;
+    uint32_t vertices;
+    uint32_t kind;
+  };
+  // By label and kind (0 depth tested and written with early depth, 1 the
+  // same with late depth (the pixel shader kills or writes depth, or alpha
+  // decides coverage), 2 tested only, 3 not tested): draws, draws with no
+  // samples, draws under 64 samples, vertices, vertices of draws with no
+  // samples.
+  static constexpr uint32_t kVisKinds = 4;
+  struct VisTotals {
+    uint64_t v[kVisKinds][5] = {};
+  };
+  void VisDrain();
+  void VisMarkRendering();
+  VkQueryPool vis_query_pool_ = VK_NULL_HANDLE;
+  bool vis_frame_ = false;
+  bool vis_reset_ = false;
+  bool vis_pending_ = false;
+  uint64_t vis_submission_ = 0;
+  uint32_t vis_retries_ = 0;
+  uint32_t vis_label_ = UINT32_MAX;
+  uint32_t vis_frames_ = 0;
+  uint32_t vis_skipped_ = 0;
+  std::vector<VisDraw> vis_draws_;
+  std::vector<std::string> vis_labels_;
+  std::unordered_map<std::string, uint32_t> vis_label_ids_;
+  std::vector<VisTotals> vis_totals_;
+  uint64_t vis_key_ = 0;
+  std::unordered_map<uint64_t, uint32_t> vis_ordinals_;
+  // Bit 0: no samples at the last census; bit 1: late depth.
+  std::unordered_map<uint64_t, uint8_t> vis_oracle_;
+  uint64_t vis_oracle_skips_ = 0;
+  uint64_t vis_oracle_draws_ = 0;
   uint64_t gpu_frames_ = 0;
   uint64_t draws_ = 0;
   uint64_t resolves_ = 0;
